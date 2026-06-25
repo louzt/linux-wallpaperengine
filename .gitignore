@@ -2,6 +2,7 @@ cmake-build-*
 .idea
 .cache/
 build/
+build-test/
 .vscode/
 .zed/
 third_party/
@@ -11,3 +12,4 @@ packaging/archlinux/*
 *-protocol.c
 *-protocol.h
 AGENTS.md
+.private/

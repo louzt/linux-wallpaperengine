@@ -500,7 +500,9 @@ if(BUILD_TESTING)
         src/WallpaperEngine/Testing/Harnesses/RenderHarness.cpp
         src/WallpaperEngine/Testing/Harnesses/RenderHarness.h
         src/WallpaperEngine/Testing/Cases/MouseCoordinates.cpp
-        tests/UserSettingParserSyntheticTest.cpp)
+        tests/UserSettingParserSyntheticTest.cpp
+        tests/WaylandFullScreenDetectorRelevanceTest.cpp
+        tests/WaylandFullScreenDetectorRelevanceLogic.cpp)
 endif()
 
 add_library(
