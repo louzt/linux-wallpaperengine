@@ -108,7 +108,16 @@ glm::ivec2 GLFWOpenGLDriver::getFramebufferSize () const {
 uint32_t GLFWOpenGLDriver::getFrameCounter () const { return this->m_frameCounter; }
 
 void GLFWOpenGLDriver::dispatchEventQueue () {
-    static float startTime, endTime, minimumTime = 1.0f / this->m_context.settings.render.maximumFPS;
+    // The minimumTime cache must be invalidated when maximumFPS changes (e.g.
+    // via the SIGWINCH runtime governor); otherwise the first frame after the
+    // change would still use the previous minimumTime.
+    static float startTime = 0.0f, endTime = 0.0f;
+    static float minimumTime = 0.0f;
+    static int last_maximumFPS = 0;
+    if (minimumTime == 0.0f || last_maximumFPS != this->m_context.settings.render.maximumFPS) {
+	minimumTime = 1.0f / this->m_context.settings.render.maximumFPS;
+	last_maximumFPS = this->m_context.settings.render.maximumFPS;
+    }
     // get the start time of the frame
     startTime = this->getRenderTime ();
     // clear the screen

@@ -59,6 +59,14 @@ int main (int argc, char* argv[]) {
 	std::signal (SIGINT, signalhandler);
 	std::signal (SIGTERM, signalhandler);
 	std::signal (SIGKILL, signalhandler);
+	// SIGWINCH: runtime FPS tier cycling (louzt fork, paperforge-compatible).
+	// Default action is Ign (process stays alive), safe to register.
+	std::signal (SIGWINCH, signalhandler);
+
+	// announce the set of installed handlers so external probes (paperforge
+	// lwe_probe.rs) can classify this binary as a SupportedFork and enable
+	// the audio-signal + FPS-signal pathways.
+	sLog.out ("signal handlers: SIGINT, SIGTERM, SIGWINCH");
 
 	// show the wallpaper application
 	app->show ();
@@ -67,6 +75,7 @@ int main (int argc, char* argv[]) {
 	std::signal (SIGINT, SIG_DFL);
 	std::signal (SIGTERM, SIG_DFL);
 	std::signal (SIGKILL, SIG_DFL);
+	std::signal (SIGWINCH, SIG_DFL);
 
 	delete app;
 

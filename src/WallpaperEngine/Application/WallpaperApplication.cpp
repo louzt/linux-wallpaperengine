@@ -21,6 +21,7 @@
 #endif /* DEMOMODE */
 
 #include <algorithm>
+#include <atomic>
 #include <numeric>
 #include <unistd.h>
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -28,6 +29,19 @@
 #include <thread>
 
 #define FULLSCREEN_CHECK_WAIT_TIME 250
+
+// Runtime FPS governor state — written by the SIGWINCH signal handler
+// (async, may interrupt any syscall) and consumed at the top of render().
+// Signal-safety: std::atomic<int> load/store with relaxed memory order are
+// the only async-safe operations we need here.
+namespace {
+std::atomic<int> g_nominal_fps {30};   // argv --fps value, captured in setup()
+std::atomic<int> g_current_fps {30};   // shadow of settings.render.maximumFPS for the signal handler
+std::atomic<int> g_pending_fps {-1};   // next FPS to apply (-1 = no change pending)
+constexpr int MIN_FPS_TIER1 = 5;       // floor for the "half" tier
+constexpr int MIN_FPS_TIER2 = 5;       // tier-2 floor (also MIN_FPS_TIER1)
+constexpr int MIN_FPS_TIER3 = 1;       // absolute minimum (battery saver)
+} // anonymous namespace
 
 float g_Time;
 float g_TimeLast;
@@ -725,6 +739,14 @@ void WallpaperApplication::setup () {
     this->prepareOutputs ();
     this->setupOpenGLDebugging ();
 
+    // Snapshot the argv-driven nominal FPS into the runtime governor so the
+    // SIGWINCH handler can compute tier transitions without touching
+    // m_context directly (data-race-free across signal boundaries).
+    const int nominal = this->m_context.settings.render.maximumFPS;
+    g_nominal_fps.store (nominal);
+    g_current_fps.store (nominal);
+    g_pending_fps.store (-1);
+
     if (this->m_context.settings.general.dumpStructure) {
 	auto prettyPrinter = Data::Dumpers::StringPrinter ();
 
@@ -750,6 +772,18 @@ void WallpaperApplication::setup () {
 }
 
 void WallpaperApplication::render () {
+    // Apply any FPS change queued by the SIGWINCH signal handler. exchange()
+    // is async-signal-safe per C++11 [atomics.signal] and gives us a one-shot
+    // transition flag (-1 means "no pending change").
+    {
+        const int pending = g_pending_fps.exchange (-1);
+        if (pending > 0) {
+            this->m_context.settings.render.maximumFPS = pending;
+            g_current_fps.store (pending);
+            sLog.out ("Applied runtime FPS change to ", pending);
+        }
+    }
+
     static time_t seconds;
     static struct tm* timeinfo;
 
@@ -870,6 +904,32 @@ void WallpaperApplication::update (Render::Drivers::Output::OutputViewport* view
 }
 
 void WallpaperApplication::signal (int signal) {
+    if (signal == SIGWINCH) {
+        // Runtime FPS governor: cycle through 4 hardcoded tiers. The signal
+        // handler is the ONLY writer of g_pending_fps; render() applies it.
+        const int nominal = g_nominal_fps.load ();
+        const int tier1 = std::max (nominal / 2, MIN_FPS_TIER1);
+        const int tier2 = MIN_FPS_TIER2;
+        const int tier3 = MIN_FPS_TIER3;
+        const int current = g_current_fps.load ();
+
+        int next = nominal;
+        if (current >= nominal) {
+            next = tier1;
+        } else if (current == tier1) {
+            next = tier2;
+        } else if (current == tier2) {
+            next = tier3;
+        } else {
+            // tier3 (1 FPS) or any unexpected value -> wrap-around
+            next = nominal;
+        }
+
+        g_pending_fps.store (next);
+        sLog.out ("SIGWINCH: queued FPS transition ", current, " -> ", next);
+        return;
+    }
+
     sLog.out ("Stop requested by signal ", signal);
     this->m_context.state.general.keepRunning = false;
 }
