@@ -131,6 +131,17 @@ public:
      */
     int decodeFrame (uint8_t* audioBuffer, int bufferSize);
 
+    /**
+     * Flushes the decoder context so a looping stream can be decoded again
+     * from its beginning.
+     *
+     * The decoder context is shared between the reader thread (which flushes
+     * it when the stream loops back to the start) and the audio thread (which
+     * decodes frames out of it), so the flush is serialized against the
+     * decode calls through the codec mutex.
+     */
+    void flushCodec ();
+
 private:
     /**
      * Initializes ffmpeg to read the given file
@@ -159,6 +170,10 @@ private:
 
     /** The SwrContext that handles resampling */
     SwrContext* m_swrctx = nullptr;
+    /** The number of channels the resampler WRITES (the audio device layout) */
+    int m_out_nb_channels = 0;
+    /** Guards the codec context against concurrent use by the reader and the audio threads */
+    SDL_mutex* m_codecMutex = nullptr;
     /** The audio context this stream will be played under */
     AudioContext& m_audioContext;
     /** If this stream was properly initialized or not */

@@ -8,6 +8,34 @@
 
 using namespace WallpaperEngine::Audio;
 
+namespace {
+/**
+ * RAII lock over the shared codec context.
+ *
+ * The decoder context is used by two threads: the reader thread flushes it
+ * when the stream loops back to its start, and the audio thread decodes
+ * frames out of it. The mutex is null only when the stream failed to
+ * initialize, in which case there is nothing to serialize.
+ */
+class CodecLock {
+public:
+    explicit CodecLock (SDL_mutex* mutex) : m_mutex (mutex) {
+	if (m_mutex != nullptr) {
+	    SDL_LockMutex (m_mutex);
+	}
+    }
+
+    ~CodecLock () {
+	if (m_mutex != nullptr) {
+	    SDL_UnlockMutex (m_mutex);
+	}
+    }
+
+private:
+    SDL_mutex* m_mutex;
+};
+} // namespace
+
 int audio_read_thread (void* arg) {
     SDL_mutex* waitMutex = SDL_CreateMutex ();
     auto* stream = static_cast<AudioStream*> (arg);
@@ -35,7 +63,11 @@ int audio_read_thread (void* arg) {
 	if (ret == AVERROR_EOF) {
 	    // seek to the beginning of the file again
 	    avformat_seek_file (stream->getFormatContext (), stream->getAudioStream (), 0, 0, 0, ~AVSEEK_FLAG_FRAME);
-	    avcodec_flush_buffers (stream->getContext ());
+	    // The decoder context is shared with the audio thread, which decodes
+	    // frames out of it: flushing it from this thread without holding the
+	    // codec mutex races with avcodec_receive_frame() and corrupts the
+	    // decoder state.
+	    stream->flushCodec ();
 
 	    // ensure the thread is not killed if audio has to be looped
 	    if (stream->isRepeat ()) {
@@ -150,6 +182,12 @@ AudioStream::~AudioStream () {
 
     this->m_audioThread = nullptr;
 
+    // the reader thread is gone by now, the codec mutex is no longer in use
+    if (this->m_codecMutex != nullptr) {
+	SDL_DestroyMutex (this->m_codecMutex);
+	this->m_codecMutex = nullptr;
+    }
+
     if (this->m_queue != nullptr) {
 	// wait for the audio buffers to be done
 	SDL_CondWait (this->m_queue->wait, this->m_queue->mutex);
@@ -260,6 +298,10 @@ void AudioStream::initialize () {
 	    break;
     }
 
+    // the resampler always writes the DEVICE layout: remember how many
+    // channels it will produce, the destination buffer has to be sized with it
+    this->m_out_nb_channels = av_get_channel_layout_nb_channels (out_channel_layout);
+
     // initialize swrctx
     this->m_swrctx = swr_alloc_set_opts (
 	nullptr, out_channel_layout, this->m_audioContext.getFormat (), this->m_audioContext.getSampleRate (),
@@ -287,6 +329,10 @@ void AudioStream::initialize () {
 	sLog.exception ("Cannot get channel layout from mask");
     }
 
+    // the resampler always writes the DEVICE layout: remember how many
+    // channels it will produce, the destination buffer has to be sized with it
+    this->m_out_nb_channels = out_channel_layout.nb_channels;
+
     swr_alloc_set_opts2 (
 	&this->m_swrctx, &out_channel_layout, this->m_audioContext.getFormat (), this->m_audioContext.getSampleRate (),
 	&this->m_context->ch_layout, this->m_context->sample_fmt, this->m_context->sample_rate, 0, nullptr
@@ -306,6 +352,13 @@ void AudioStream::initialize () {
     this->m_queue->mutex = SDL_CreateMutex ();
     this->m_queue->cond = SDL_CreateCond ();
     this->m_queue->wait = SDL_CreateCond ();
+
+    // The codec context is shared between the reader thread (which flushes it
+    // when the stream loops back to its start) and the audio thread (which
+    // decodes frames out of it): a dedicated mutex serializes both accesses.
+    if (this->m_codecMutex == nullptr) {
+	this->m_codecMutex = SDL_CreateMutex ();
+    }
 
     this->m_decodeFrame = av_frame_alloc ();
     this->m_decodePacket = av_packet_alloc ();
@@ -445,11 +498,32 @@ void AudioStream::stop () {
     this->m_initialized = false;
 }
 
+/**
+ * Frees a sample buffer allocated with av_samples_alloc_array_and_samples().
+ *
+ * A planar format gives every channel its own plane, a packed one keeps the
+ * whole buffer in the first slot. av_samples_free() cannot be used here: it
+ * treats audio_data[0] as a plane pointer, which is wrong for packed buffers.
+ */
+static void free_resampled_data (uint8_t**& resampled_data, const int nb_channels, const AVSampleFormat format) {
+    if (resampled_data == nullptr) {
+	return;
+    }
+
+    if (av_sample_fmt_is_planar (format)) {
+	for (int i = 0; i < nb_channels; i++) {
+	    av_freep (&resampled_data[i]);
+	}
+    } else {
+	av_freep (&resampled_data[0]);
+    }
+
+    av_freep (&resampled_data);
+}
+
 int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
     int out_linesize = 0;
     int ret;
-    int out_nb_channels;
-    int out_nb_samples;
     uint8_t** resampled_data = nullptr;
     int resampled_data_size;
 
@@ -460,74 +534,38 @@ int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
 	return -1;
     }
 
-    int max_out_nb_samples = out_nb_samples = av_rescale_rnd (
-	in_nb_samples, this->m_audioContext.getSampleRate (), this->getContext ()->sample_rate, AV_ROUND_UP
-    );
+    // The resampler always writes the DEVICE layout, no matter what the
+    // decoded track holds: a mono track on a stereo device is upmixed to two
+    // channels. The destination buffer MUST be sized with that same count.
+    // Sizing it with the DECODER's channel count (what this function used to
+    // do) under-allocates mono sources on a stereo device and the resampler
+    // then writes past the end of the buffer, corrupting the next heap chunk
+    // and aborting the process with "free(): invalid next size (normal)".
+    const int out_nb_channels = this->m_out_nb_channels;
 
-    // check rescaling was successful
-    if (max_out_nb_samples <= 0) {
-	sLog.error ("av_rescale_rnd error.");
+    if (out_nb_channels <= 0) {
+	sLog.error ("No output channel count known for the resampler.");
 	return -1;
     }
 
-    // get number of output audio channels
-#if FF_API_OLD_CHANNEL_LAYOUT
-    int64_t out_channel_layout;
+    // swr_get_out_samples() is the documented upper bound of the samples the
+    // next swr_convert() call produces for in_nb_samples input samples: it
+    // accounts for the resampler's internal delay.
+    const int max_out_nb_samples = swr_get_out_samples (this->m_swrctx, in_nb_samples);
 
-    // set output audio channels based on the input audio channels
-    switch (this->m_audioContext.getChannels ()) {
-	case 1:
-	    out_channel_layout = AV_CH_LAYOUT_MONO;
-	    break;
-	case 2:
-	    out_channel_layout = AV_CH_LAYOUT_STEREO;
-	    break;
-	default:
-	    out_channel_layout = AV_CH_LAYOUT_SURROUND;
-	    break;
+    // check the sample count was correctly retrieved
+    if (max_out_nb_samples <= 0) {
+	sLog.error ("swr_get_out_samples error.");
+	return -1;
     }
 
-    out_nb_channels = av_get_channel_layout_nb_channels (out_channel_layout);
-#else
-    out_nb_channels = this->getContext ()->ch_layout.nb_channels;
-#endif
     ret = av_samples_alloc_array_and_samples (
-	&resampled_data, &out_linesize, out_nb_channels, out_nb_samples, this->m_audioContext.getFormat (), 0
+	&resampled_data, &out_linesize, out_nb_channels, max_out_nb_samples, this->m_audioContext.getFormat (), 0
     );
 
     if (ret < 0) {
 	sLog.error ("av_samples_alloc_array_and_samples() error: Could not allocate destination samples.");
 	return -1;
-    }
-
-    // retrieve output samples number taking into account the progressive delay
-    out_nb_samples = av_rescale_rnd (
-	swr_get_delay (this->m_swrctx, this->getContext ()->sample_rate) + in_nb_samples,
-	this->m_audioContext.getSampleRate (), this->getContext ()->sample_rate, AV_ROUND_UP
-    );
-
-    // check output samples number was correctly retrieved
-    if (out_nb_samples <= 0) {
-	sLog.error ("av_rescale_rnd error");
-	return -1;
-    }
-
-    if (out_nb_samples > max_out_nb_samples) {
-	// free memory block and set pointer to NULL
-	av_freep (&resampled_data[0]);
-
-	// Allocate a samples buffer for out_nb_samples samples
-	ret = av_samples_alloc (
-	    resampled_data, &out_linesize, out_nb_channels, out_nb_samples, this->m_audioContext.getFormat (), 1
-	);
-
-	// check samples buffer correctly allocated
-	if (ret < 0) {
-	    sLog.error ("av_samples_alloc failed.");
-	    return -1;
-	}
-
-	max_out_nb_samples = out_nb_samples;
     }
 
     // do the actual audio data resampling
@@ -539,6 +577,7 @@ int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
     // check audio conversion was successful
     if (ret < 0) {
 	sLog.error ("swr_convert_error.");
+	free_resampled_data (resampled_data, out_nb_channels, this->m_audioContext.getFormat ());
 	return -1;
     }
 
@@ -549,21 +588,37 @@ int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
     // check audio buffer size
     if (resampled_data_size < 0) {
 	sLog.error ("av_samples_get_buffer_size error.");
+	free_resampled_data (resampled_data, out_nb_channels, this->m_audioContext.getFormat ());
+	return -1;
+    }
+
+    // the driver mixes interleaved samples, a planar buffer cannot be copied
+    // over as-is
+    if (av_sample_fmt_is_planar (this->m_audioContext.getFormat ())) {
+	sLog.error ("Planar output format is not supported by the audio driver.");
+	free_resampled_data (resampled_data, out_nb_channels, this->m_audioContext.getFormat ());
 	return -1;
     }
 
     // copy the resampled data to the output buffer up to out_size bytes
-    memcpy (out_buf, resampled_data[0], std::min (resampled_data_size, out_size));
+    const int copy_size = std::min (resampled_data_size, out_size);
+    memcpy (out_buf, resampled_data[0], copy_size);
 
     // memory cleanup
-    if (resampled_data) {
-	// free memory block and set pointer to NULL
-	av_freep (&resampled_data[0]);
-    }
+    free_resampled_data (resampled_data, out_nb_channels, this->m_audioContext.getFormat ());
 
-    av_freep (&resampled_data);
+    // the driver mixes exactly this many bytes out of the buffer
+    return copy_size;
+}
 
-    return resampled_data_size;
+void AudioStream::flushCodec () {
+    // The decoder context is shared between the reader thread (which flushes
+    // it when the stream loops back to its start) and the audio thread (which
+    // decodes frames out of it): the flush is serialized against the decode
+    // calls through the codec mutex.
+    CodecLock lock (this->m_codecMutex);
+
+    avcodec_flush_buffers (this->getContext ());
 }
 
 int AudioStream::decodeFrame (uint8_t* audioBuffer, const int bufferSize) {
@@ -573,17 +628,27 @@ int AudioStream::decodeFrame (uint8_t* audioBuffer, const int bufferSize) {
     while (this->m_audioContext.getApplicationContext ().state.general.keepRunning) {
 	while (audio_pkt_size > 0 && this->m_audioContext.getApplicationContext ().state.general.keepRunning) {
 	    int got_frame = 0;
-	    int ret = avcodec_receive_frame (this->getContext (), this->m_decodeFrame);
+	    int ret = 0;
 
-	    if (ret == 0) {
-		got_frame = 1;
+	    {
+		// the decoder context is shared with the reader thread, which
+		// flushes it when the stream loops back to the start: don't
+		// decode while it is being flushed
+		CodecLock lock (this->m_codecMutex);
+
+		ret = avcodec_receive_frame (this->getContext (), this->m_decodeFrame);
+
+		if (ret == 0) {
+		    got_frame = 1;
+		}
+		if (ret == AVERROR (EAGAIN)) {
+		    ret = 0;
+		}
+		if (ret == 0) {
+		    ret = avcodec_send_packet (this->getContext (), this->m_decodePacket);
+		}
 	    }
-	    if (ret == AVERROR (EAGAIN)) {
-		ret = 0;
-	    }
-	    if (ret == 0) {
-		ret = avcodec_send_packet (this->getContext (), this->m_decodePacket);
-	    }
+
 	    if (ret < 0 && ret != AVERROR (EAGAIN)) {
 		return -1;
 	    }
