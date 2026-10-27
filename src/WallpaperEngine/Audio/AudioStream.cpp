@@ -1,4 +1,5 @@
 #include "AudioStream.h"
+#include "WallpaperEngine/Audio/AudioResampleSizing.h"
 #include "WallpaperEngine/Logging/Log.h"
 #include <cassert>
 #include <cmath>
@@ -34,6 +35,21 @@ public:
 private:
     SDL_mutex* m_mutex;
 };
+
+/**
+ * Returns the channel count of a decoded frame.
+ *
+ * The frame is the one holding the samples the resampler is about to convert,
+ * so its channel count is the decoder's one: the layout of the source track,
+ * which is NOT the layout the resampler writes.
+ */
+int get_frame_nb_channels (const AVFrame* frame) {
+#if FF_API_OLD_CHANNEL_LAYOUT
+	return frame->channels;
+#else
+	return frame->ch_layout.nb_channels;
+#endif
+}
 } // namespace
 
 int audio_read_thread (void* arg) {
@@ -534,20 +550,6 @@ int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
 	return -1;
     }
 
-    // The resampler always writes the DEVICE layout, no matter what the
-    // decoded track holds: a mono track on a stereo device is upmixed to two
-    // channels. The destination buffer MUST be sized with that same count.
-    // Sizing it with the DECODER's channel count (what this function used to
-    // do) under-allocates mono sources on a stereo device and the resampler
-    // then writes past the end of the buffer, corrupting the next heap chunk
-    // and aborting the process with "free(): invalid next size (normal)".
-    const int out_nb_channels = this->m_out_nb_channels;
-
-    if (out_nb_channels <= 0) {
-	sLog.error ("No output channel count known for the resampler.");
-	return -1;
-    }
-
     // swr_get_out_samples() is the documented upper bound of the samples the
     // next swr_convert() call produces for in_nb_samples input samples: it
     // accounts for the resampler's internal delay.
@@ -559,8 +561,29 @@ int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
 	return -1;
     }
 
+    // The resampler always writes the DEVICE layout, no matter what the
+    // decoded track holds: a mono track on a stereo device is upmixed to two
+    // channels. The destination buffer MUST be sized with that same count.
+    // Sizing it with the DECODER's channel count (what this function used to
+    // do) under-allocates mono sources on a stereo device and the resampler
+    // then writes past the end of the buffer, corrupting the next heap chunk
+    // and aborting the process with "free(): invalid next size (normal)".
+    //
+    // The decision lives in computeResampleBufferSizing() so it can be pinned
+    // down by the test suite: the decoder's channel count is handed over to it
+    // on purpose, and it is the one that must not influence the result.
+    const auto sizing = computeResampleBufferSizing (
+	this->m_out_nb_channels, get_frame_nb_channels (this->m_decodeFrame), max_out_nb_samples,
+	av_get_bytes_per_sample (this->m_audioContext.getFormat ()), RESAMPLE_BUFFER_ALIGNMENT
+    );
+
+    if (!sizing.valid) {
+	sLog.error ("Cannot compute the size of the resampler destination buffer.");
+	return -1;
+    }
+
     ret = av_samples_alloc_array_and_samples (
-	&resampled_data, &out_linesize, out_nb_channels, max_out_nb_samples, this->m_audioContext.getFormat (), 0
+	&resampled_data, &out_linesize, sizing.channels, sizing.max_out_nb_samples, this->m_audioContext.getFormat (), 0
     );
 
     if (ret < 0) {
@@ -568,27 +591,45 @@ int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
 	return -1;
     }
 
+    // the allocation has to be able to hold the whole resampled chunk
+    const int allocated_bytes = av_samples_get_buffer_size (
+	nullptr, sizing.channels, sizing.max_out_nb_samples, this->m_audioContext.getFormat (), 0
+    );
+
+    if (allocated_bytes < sizing.buffer_bytes) {
+	sLog.error ("The resampler destination buffer is smaller than the data it has to hold.");
+	free_resampled_data (resampled_data, sizing.channels, this->m_audioContext.getFormat ());
+	return -1;
+    }
+
     // do the actual audio data resampling
     ret = swr_convert (
-	this->m_swrctx, resampled_data, max_out_nb_samples, const_cast<const uint8_t**> (this->m_decodeFrame->data),
+	this->m_swrctx, resampled_data, sizing.max_out_nb_samples, const_cast<const uint8_t**> (this->m_decodeFrame->data),
 	this->m_decodeFrame->nb_samples
     );
 
     // check audio conversion was successful
     if (ret < 0) {
 	sLog.error ("swr_convert_error.");
-	free_resampled_data (resampled_data, out_nb_channels, this->m_audioContext.getFormat ());
+	free_resampled_data (resampled_data, sizing.channels, this->m_audioContext.getFormat ());
 	return -1;
     }
 
     // Get the required buffer size for the given audio parameters
     resampled_data_size
-	= av_samples_get_buffer_size (&out_linesize, out_nb_channels, ret, this->m_audioContext.getFormat (), 1);
+	= av_samples_get_buffer_size (&out_linesize, sizing.channels, ret, this->m_audioContext.getFormat (), 1);
 
     // check audio buffer size
     if (resampled_data_size < 0) {
 	sLog.error ("av_samples_get_buffer_size error.");
-	free_resampled_data (resampled_data, out_nb_channels, this->m_audioContext.getFormat ());
+	free_resampled_data (resampled_data, sizing.channels, this->m_audioContext.getFormat ());
+	return -1;
+    }
+
+    // the resampler must never write more than what the destination buffer holds
+    if (resampled_data_size > sizing.buffer_bytes) {
+	sLog.error ("The resampler wrote more data than the destination buffer holds.");
+	free_resampled_data (resampled_data, sizing.channels, this->m_audioContext.getFormat ());
 	return -1;
     }
 
@@ -596,7 +637,7 @@ int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
     // over as-is
     if (av_sample_fmt_is_planar (this->m_audioContext.getFormat ())) {
 	sLog.error ("Planar output format is not supported by the audio driver.");
-	free_resampled_data (resampled_data, out_nb_channels, this->m_audioContext.getFormat ());
+	free_resampled_data (resampled_data, sizing.channels, this->m_audioContext.getFormat ());
 	return -1;
     }
 
@@ -605,7 +646,7 @@ int AudioStream::resampleAudio (uint8_t* out_buf, const int out_size) {
     memcpy (out_buf, resampled_data[0], copy_size);
 
     // memory cleanup
-    free_resampled_data (resampled_data, out_nb_channels, this->m_audioContext.getFormat ());
+    free_resampled_data (resampled_data, sizing.channels, this->m_audioContext.getFormat ());
 
     // the driver mixes exactly this many bytes out of the buffer
     return copy_size;

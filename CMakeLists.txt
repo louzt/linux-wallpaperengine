@@ -322,6 +322,8 @@ set(COMMON_SOURCES
     src/WallpaperEngine/Audio/AudioContext.h
     src/WallpaperEngine/Audio/AudioStream.cpp
     src/WallpaperEngine/Audio/AudioStream.h
+    src/WallpaperEngine/Audio/AudioResampleSizing.cpp
+    src/WallpaperEngine/Audio/AudioResampleSizing.h
 
     src/WallpaperEngine/Input/InputContext.cpp
     src/WallpaperEngine/Input/InputContext.h
@@ -502,7 +504,8 @@ if(BUILD_TESTING)
         src/WallpaperEngine/Testing/Cases/MouseCoordinates.cpp
         tests/UserSettingParserSyntheticTest.cpp
         tests/WaylandFullScreenDetectorRelevanceTest.cpp
-        tests/WaylandFullScreenDetectorRelevanceLogic.cpp)
+        tests/WaylandFullScreenDetectorRelevanceLogic.cpp
+        tests/AudioResampleSizingTest.cpp)
 endif()
 
 add_library(
