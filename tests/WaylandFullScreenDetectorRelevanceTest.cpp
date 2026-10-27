@@ -3,7 +3,18 @@
 #include <string>
 #include <vector>
 
-#include "WallpaperEngine/Render/Drivers/Detectors/WaylandFullScreenDetector.h"
+// The production header is empty unless ENABLE_WAYLAND is defined, and that
+// macro is only set for the library target, so the declaration of the helper
+// this suite exercises is repeated here. The definition lives in
+// tests/WaylandFullScreenDetectorRelevanceLogic.cpp, the mirror of the
+// production logic.
+namespace WallpaperEngine::Render::Drivers::Detectors {
+bool isFullscreenRelevantParams (
+    const bool pauseOnFullscreen, const bool pauseOnFullscreenOnlyWhenActive,
+    const std::vector<std::string>& ignoreAppIds, const bool fullscreen, const bool activated,
+    const std::string& appId
+);
+} // namespace WallpaperEngine::Render::Drivers::Detectors
 
 using WallpaperEngine::Render::Drivers::Detectors::isFullscreenRelevantParams;
 
